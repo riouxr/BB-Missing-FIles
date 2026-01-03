@@ -1,7 +1,7 @@
 bl_info = {
     "name": "BB Missing File Manager",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (3, 0, 0),
     "location": "Shader Editor > Sidebar > Missing Files",
     "description": "Manage and relink all missing files (textures, videos, sounds, etc.) in your scene",
@@ -18,16 +18,19 @@ class MissingFileItem(PropertyGroup):
     """Property group to store missing file information"""
     filepath: StringProperty(name="File Path")
     file_name: StringProperty(name="File Name")
-    file_type: StringProperty(name="File Type")  # 'IMAGE', 'MOVIE', 'SOUND', etc.
+    file_type: StringProperty(name="File Type")  # 'IMAGE', 'MOVIE', 'SOUND', 'LINKED', etc.
     material_names: StringProperty(name="Materials")
     object_names: StringProperty(name="Objects")
     node_names: StringProperty(name="Nodes")
     is_used: BoolProperty(name="Is Used", default=True)
+    is_linked: BoolProperty(name="Is Linked", default=False)
+    library_path: StringProperty(name="Library Path", default="")
     new_filepath: StringProperty(
         name="New Path",
         description="New file path for the file",
         subtype='FILE_PATH'
     )
+
 
 
 class MissingFileSettings(PropertyGroup):
@@ -42,6 +45,13 @@ class MissingFileSettings(PropertyGroup):
         description="Show files that are not used in the scene",
         default=True
     )
+    # Collapse/expand state for each file type
+    show_images: BoolProperty(name="Show Images", default=True)
+    show_movies: BoolProperty(name="Show Movies", default=True)
+    show_sounds: BoolProperty(name="Show Sounds", default=True)
+    show_caches: BoolProperty(name="Show Caches", default=True)
+    show_linked: BoolProperty(name="Show Linked Files", default=True)
+
 
 
 class FILE_OT_scan_missing(Operator):
@@ -72,12 +82,18 @@ class FILE_OT_scan_missing(Operator):
                             filepath = image.filepath
                             
                             if filepath not in missing_files:
+                                # Determine if it's linked and what type
+                                is_linked = image.library is not None
+                                file_type = 'LINKED' if is_linked else 'IMAGE'
+                                
                                 missing_files[filepath] = {
                                     'file_name': image.name,
-                                    'file_type': 'IMAGE',
+                                    'file_type': file_type,
                                     'materials': set(),
                                     'objects': set(),
-                                    'node_names': set()
+                                    'node_names': set(),
+                                    'is_linked': is_linked,
+                                    'library_path': image.library.filepath if is_linked else ''
                                 }
                             
                             missing_files[filepath]['materials'].add(material.name)
@@ -163,6 +179,8 @@ class FILE_OT_scan_missing(Operator):
             item.object_names = ", ".join(sorted(data['objects'])) if data['objects'] else "(unused)"
             item.node_names = ", ".join(sorted(data['node_names'])) if data['node_names'] else "(none)"
             item.is_used = len(data['objects']) > 0
+            item.is_linked = data.get('is_linked', False)
+            item.library_path = data.get('library_path', '')
         
         self.report({'INFO'}, f"Found {len(missing_files)} missing files")
         return {'FINISHED'}
@@ -747,12 +765,14 @@ class FILE_PT_missing_panel_shader(Panel):
             box.label(text="No missing files found", icon='CHECKMARK')
             box.label(text="Click 'Scan' to check for issues")
         else:
-            # Count filtered files
-            filtered_files = [item for item in scene.missing_files 
-                            if (item.is_used and settings.show_used) or 
-                               (not item.is_used and settings.show_unused)]
-            
-            layout.label(text=f"Missing Files: {len(scene.missing_files)} (Showing: {len(filtered_files)})", icon='ERROR')
+            # Group files by type
+            files_by_type = {
+                'IMAGE': [],
+                'MOVIE': [],
+                'SOUND': [],
+                'CACHE': [],
+                'LINKED': []
+            }
             
             for idx, item in enumerate(scene.missing_files):
                 # Apply filter
@@ -761,66 +781,124 @@ class FILE_PT_missing_panel_shader(Panel):
                 if not item.is_used and not settings.show_unused:
                     continue
                 
-                box = layout.box()
+                # Add to appropriate group
+                file_type = item.file_type
+                if file_type not in files_by_type:
+                    file_type = 'IMAGE'  # Default
+                files_by_type[file_type].append((idx, item))
+            
+            # Count total
+            total_filtered = sum(len(files) for files in files_by_type.values())
+            layout.label(text=f"Missing Files: {len(scene.missing_files)} (Showing: {total_filtered})", icon='ERROR')
+            
+            # Display each type group
+            type_info = [
+                ('IMAGE', 'Images', 'IMAGE_DATA', settings.show_images),
+                ('MOVIE', 'Movies', 'SEQUENCE', settings.show_movies),
+                ('SOUND', 'Sounds', 'SOUND', settings.show_sounds),
+                ('CACHE', 'Caches', 'FILE_CACHE', settings.show_caches),
+                ('LINKED', 'Linked Files', 'LINK_BLEND', settings.show_linked)
+            ]
+            
+            for file_type, label, icon, show_prop in type_info:
+                files = files_by_type[file_type]
+                if len(files) == 0:
+                    continue
                 
-                # File info
-                col = box.column(align=True)
+                # Type header with collapse button
+                type_box = layout.box()
+                header_row = type_box.row()
                 
-                # Status indicator row
-                status_row = col.row(align=True)
-                if item.is_used:
-                    status_row.label(text="Status: USED IN SCENE", icon='CHECKMARK')
-                else:
-                    status_row.label(text="Status: UNUSED", icon='X')
+                # Determine the correct property name
+                if file_type == 'IMAGE':
+                    prop_name = "show_images"
+                elif file_type == 'MOVIE':
+                    prop_name = "show_movies"
+                elif file_type == 'SOUND':
+                    prop_name = "show_sounds"
+                elif file_type == 'CACHE':
+                    prop_name = "show_caches"
+                elif file_type == 'LINKED':
+                    prop_name = "show_linked"
                 
-                # File type and name
-                col.label(text=f"Type: {item.file_type}", icon='FILE')
-                col.label(text=f"File: {item.file_name}", icon='TEXTURE')
+                header_row.prop(settings, prop_name,
+                               icon='TRIA_DOWN' if show_prop else 'TRIA_RIGHT',
+                               text="", emboss=False)
+                header_row.label(text=f"{label}: {len(files)}", icon=icon)
                 
-                # Original path (split into multiple lines if too long)
-                split_box = col.box()
-                split_col = split_box.column(align=True)
-                split_col.scale_y = 0.7
-                split_col.label(text="Original Path:")
-                
-                # Split long paths
-                path_parts = item.filepath.split(os.sep)
-                if len(path_parts) > 3:
-                    split_col.label(text="..." + os.sep + os.sep.join(path_parts[-3:]))
-                else:
-                    split_col.label(text=item.filepath)
-                
-                split_col.label(text=f"Materials: {item.material_names}")
-                split_col.label(text=f"Objects: {item.object_names}")
-                
-                col.separator(factor=0.5)
-                
-                # If used, show relink options
-                if item.is_used:
-                    # New path input
-                    col.prop(item, "new_filepath", text="New Path")
-                    
-                    # Relink button
-                    row = col.row()
-                    row.scale_y = 1.3
-                    op = row.operator("file.relink_single", text="Relink This File", icon='LINKED')
-                    op.index = idx
-                    
-                    # Auto Find and Delete buttons side by side
-                    row = col.row(align=True)
-                    op = row.operator("file.auto_search", text="Auto Find", icon='VIEWZOOM')
-                    op.index = idx
-                    op = row.operator("file.remove_file", text="Delete", icon='TRASH')
-                    op.index = idx
-                else:
-                    # If unused, show remove button
-                    col.label(text="This file is not used in any objects")
-                    row = col.row()
-                    row.scale_y = 1.3
-                    op = row.operator("file.remove_file", text="Remove from File", icon='TRASH')
-                    op.index = idx
-                
-                layout.separator()
+                # Show files if expanded
+                if show_prop:
+                    for idx, item in files:
+                        box = type_box.box()
+                        col = box.column(align=True)
+                        
+                        # Status indicator row
+                        status_row = col.row(align=True)
+                        if item.is_used:
+                            status_row.label(text="Status: USED IN SCENE", icon='CHECKMARK')
+                        else:
+                            status_row.label(text="Status: UNUSED", icon='X')
+                        
+                        # File name
+                        col.label(text=f"File: {item.file_name}", icon='TEXTURE')
+                        
+                        # For linked files, show library path
+                        if item.is_linked and item.library_path:
+                            split_box = col.box()
+                            split_col = split_box.column(align=True)
+                            split_col.scale_y = 0.7
+                            split_col.label(text="Linked from:")
+                            lib_parts = item.library_path.split(os.sep)
+                            if len(lib_parts) > 3:
+                                split_col.label(text="..." + os.sep + os.sep.join(lib_parts[-3:]))
+                            else:
+                                split_col.label(text=item.library_path)
+                            split_col.label(text="(Read-only - fix in original file)", icon='INFO')
+                        
+                        # Original path
+                        split_box = col.box()
+                        split_col = split_box.column(align=True)
+                        split_col.scale_y = 0.7
+                        split_col.label(text="Original Path:")
+                        path_parts = item.filepath.split(os.sep)
+                        if len(path_parts) > 3:
+                            split_col.label(text="..." + os.sep + os.sep.join(path_parts[-3:]))
+                        else:
+                            split_col.label(text=item.filepath)
+                        split_col.label(text=f"Materials: {item.material_names}")
+                        split_col.label(text=f"Objects: {item.object_names}")
+                        
+                        col.separator(factor=0.5)
+                        
+                        # Only show relink options for non-linked files
+                        if item.is_linked:
+                            col.label(text="Linked files cannot be relinked here", icon='INFO')
+                        elif item.is_used:
+                            # New path input
+                            col.prop(item, "new_filepath", text="New Path")
+                            
+                            # Relink button
+                            row = col.row()
+                            row.scale_y = 1.3
+                            op = row.operator("file.relink_single", text="Relink This File", icon='LINKED')
+                            op.index = idx
+                            
+                            # Auto Find and Delete buttons
+                            row = col.row(align=True)
+                            op = row.operator("file.auto_search", text="Auto Find", icon='VIEWZOOM')
+                            op.index = idx
+                            op = row.operator("file.remove_file", text="Delete", icon='TRASH')
+                            op.index = idx
+                        else:
+                            # Unused file
+                            col.label(text="This file is not used in any objects")
+                            row = col.row()
+                            row.scale_y = 1.3
+                            op = row.operator("file.remove_file", text="Remove from File", icon='TRASH')
+                            op.index = idx
+                        
+                        type_box.separator(factor=0.5)
+
 
 
 classes = (
