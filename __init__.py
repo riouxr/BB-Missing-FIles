@@ -1,7 +1,7 @@
 bl_info = {
     "name": "BB Missing File Manager",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 0, 1),
+    "version": (1, 0, 4),
     "blender": (3, 0, 0),
     "location": "Shader Editor > Sidebar > Missing Files",
     "description": "Manage and relink all missing files (textures, videos, sounds, etc.) in your scene",
@@ -160,14 +160,25 @@ class FILE_OT_scan_missing(Operator):
                 if hasattr(modifier, 'filepath'):
                     filepath = modifier.filepath
                     if filepath and not os.path.exists(bpy.path.abspath(filepath)):
+                        # Get filename - handle cases where filepath is just a directory
+                        filename = os.path.basename(filepath)
+                        if not filename:  # filepath is a directory or empty
+                            # Try to get filename from the full path
+                            abs_path = bpy.path.abspath(filepath)
+                            filename = os.path.basename(abs_path.rstrip('/\\'))
+                            if not filename:
+                                filename = f"{modifier.name}_cache"
+                        
                         if filepath not in missing_files:
                             missing_files[filepath] = {
-                                'file_name': os.path.basename(filepath),
+                                'file_name': filename,
                                 'file_type': 'CACHE',
                                 'materials': set(),
                                 'objects': {obj.name},
-                                'node_names': set()
+                                'node_names': set(),
+                                'modifier_name': modifier.name  # Store modifier name for reference
                             }
+
         
         # Add to the collection property
         for filepath, data in missing_files.items():
@@ -224,6 +235,11 @@ class FILE_OT_relink_single(Operator):
         name_different = old_name.lower() != new_name.lower()
         ext_different = old_ext.lower() != new_ext.lower()
         
+        # Special case: if original has no extension and new file has same base name, allow it
+        if not old_ext and old_name.lower() == new_name.lower():
+            # Base names match, extension was added - this is OK
+            return self.execute(context)
+        
         # If different, show warning with custom dialog
         if name_different or ext_different:
             return context.window_manager.invoke_props_dialog(self, width=450)
@@ -278,34 +294,20 @@ class FILE_OT_relink_single(Operator):
         
         new_path = bpy.path.abspath(item.new_filepath)
         
-        # Remember if this was a folder selection (before we modify new_filepath)
-        was_folder_selection = os.path.isdir(new_path)
-        original_search_root = new_path if was_folder_selection else None
-        
-        # If user selected a folder, look for the file with the same name recursively
-        if was_folder_selection:
+        # If user selected a folder, look for the file with the same name in that folder
+        if os.path.isdir(new_path):
             original_filename = os.path.basename(item.filepath)
-            found_path = None
+            new_path = os.path.join(new_path, original_filename)
             
-            # Search recursively through all subfolders
-            for root, dirs, files in os.walk(new_path):
-                if original_filename in files:
-                    found_path = os.path.join(root, original_filename)
-                    break
-            
-            if found_path:
+            if os.path.exists(new_path):
                 # Update the new_filepath to the actual file
                 try:
-                    item.new_filepath = bpy.path.relpath(found_path)
+                    item.new_filepath = bpy.path.relpath(new_path)
                 except:
-                    item.new_filepath = found_path
-                
-                # Show relative path from selected folder
-                rel_to_selected = os.path.relpath(found_path, new_path)
-                self.report({'INFO'}, f"Found file: {rel_to_selected}")
-                new_path = found_path
+                    item.new_filepath = new_path
+                self.report({'INFO'}, f"Found file in selected folder: {original_filename}")
             else:
-                self.report({'ERROR'}, f"File '{original_filename}' not found in selected folder or subfolders")
+                self.report({'ERROR'}, f"File '{original_filename}' not found in selected folder")
                 return {'CANCELLED'}
         elif not os.path.exists(new_path):
             self.report({'ERROR'}, f"File does not exist: {new_path}")
@@ -365,16 +367,9 @@ class FILE_OT_relink_single(Operator):
                     except Exception as e:
                         self.report({'ERROR'}, f"Failed to update cache: {str(e)}")
         
-        # AUTO-RELINK: Check if there are other missing files
-        # If we used folder selection, search the entire folder tree
+        # AUTO-RELINK: Check if there are other missing files in the same directory
         new_directory = os.path.dirname(bpy.path.abspath(item.new_filepath))
         auto_relinked = 0
-        
-        # Use the original folder if it was a folder selection, otherwise just the file's directory
-        if original_search_root:
-            search_root = original_search_root
-        else:
-            search_root = new_directory
         
         for other_item in context.scene.missing_files:
             if other_item.filepath == old_filepath:
@@ -382,21 +377,15 @@ class FILE_OT_relink_single(Operator):
             
             # Get the filename of the missing file
             missing_filename = os.path.basename(other_item.filepath)
+            potential_path = os.path.join(new_directory, missing_filename)
             
-            # Search recursively in the root folder
-            found_path = None
-            for root, dirs, files in os.walk(search_root):
-                if missing_filename in files:
-                    found_path = os.path.join(root, missing_filename)
-                    break
-            
-            # If we found the file somewhere, relink it
-            if found_path:
+            # Check if this file exists in the same directory
+            if os.path.exists(potential_path):
                 # Convert to relative path if possible
                 try:
-                    relative_path = bpy.path.relpath(found_path)
+                    relative_path = bpy.path.relpath(potential_path)
                 except:
-                    relative_path = found_path
+                    relative_path = potential_path
                 
                 # Relink this file automatically
                 old_path = other_item.filepath
