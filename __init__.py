@@ -1,0 +1,804 @@
+bl_info = {
+    "name": "BB Missing File Manager",
+    "author": "Blender Bob & Claude.ai",
+    "version": (1, 0, 0),
+    "blender": (3, 0, 0),
+    "location": "Shader Editor > Sidebar > Missing Files",
+    "description": "Manage and relink all missing files (textures, videos, sounds, etc.) in your scene",
+    "category": "Material",
+}
+
+import bpy
+import os
+from bpy.props import StringProperty, IntProperty, BoolProperty
+from bpy.types import Operator, Panel, PropertyGroup
+
+
+class MissingFileItem(PropertyGroup):
+    """Property group to store missing file information"""
+    filepath: StringProperty(name="File Path")
+    file_name: StringProperty(name="File Name")
+    file_type: StringProperty(name="File Type")  # 'IMAGE', 'MOVIE', 'SOUND', etc.
+    material_names: StringProperty(name="Materials")
+    object_names: StringProperty(name="Objects")
+    node_names: StringProperty(name="Nodes")
+    is_used: BoolProperty(name="Is Used", default=True)
+    new_filepath: StringProperty(
+        name="New Path",
+        description="New file path for the file",
+        subtype='FILE_PATH'
+    )
+
+
+class MissingFileSettings(PropertyGroup):
+    """Settings for filtering missing files"""
+    show_used: BoolProperty(
+        name="Show Used",
+        description="Show files that are used in the scene",
+        default=True
+    )
+    show_unused: BoolProperty(
+        name="Show Unused",
+        description="Show files that are not used in the scene",
+        default=True
+    )
+
+
+class FILE_OT_scan_missing(Operator):
+    """Scan the scene for all missing files"""
+    bl_idname = "file.scan_missing"
+    bl_label = "Scan for Missing Files"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        # Clear existing list
+        context.scene.missing_files.clear()
+        
+        missing_files = {}
+        
+        # Scan for missing IMAGE files
+        for material in bpy.data.materials:
+            if material.use_nodes and material.node_tree:
+                for node in material.node_tree.nodes:
+                    # Image textures
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        image = node.image
+                        
+                        if image.filepath and not os.path.exists(bpy.path.abspath(image.filepath)):
+                            filepath = image.filepath
+                            
+                            if filepath not in missing_files:
+                                missing_files[filepath] = {
+                                    'file_name': image.name,
+                                    'file_type': 'IMAGE',
+                                    'materials': set(),
+                                    'objects': set(),
+                                    'node_names': set()
+                                }
+                            
+                            missing_files[filepath]['materials'].add(material.name)
+                            missing_files[filepath]['node_names'].add(node.name)
+                            
+                            for obj in bpy.data.objects:
+                                if obj.type == 'MESH' and obj.data.materials:
+                                    if material.name in [mat.name for mat in obj.data.materials if mat]:
+                                        missing_files[filepath]['objects'].add(obj.name)
+        
+        # Scan for missing MOVIE files (video textures)
+        for material in bpy.data.materials:
+            if material.use_nodes and material.node_tree:
+                for node in material.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'MOVIE':
+                        image = node.image
+                        
+                        if image.filepath and not os.path.exists(bpy.path.abspath(image.filepath)):
+                            filepath = image.filepath
+                            
+                            if filepath not in missing_files:
+                                missing_files[filepath] = {
+                                    'file_name': image.name,
+                                    'file_type': 'MOVIE',
+                                    'materials': set(),
+                                    'objects': set(),
+                                    'node_names': set()
+                                }
+        
+        # Scan for missing movie clips (sequencer, motion tracking)
+        for clip in bpy.data.movieclips:
+            if clip.filepath and not os.path.exists(bpy.path.abspath(clip.filepath)):
+                filepath = clip.filepath
+                if filepath not in missing_files:
+                    missing_files[filepath] = {
+                        'file_name': clip.name,
+                        'file_type': 'MOVIE CLIP',
+                        'materials': set(),
+                        'objects': set(),
+                        'node_names': set()
+                    }
+        
+        # Scan for missing SOUND files
+        for sound in bpy.data.sounds:
+            if sound.filepath and not os.path.exists(bpy.path.abspath(sound.filepath)):
+                filepath = sound.filepath
+                if filepath not in missing_files:
+                    missing_files[filepath] = {
+                        'file_name': sound.name,
+                        'file_type': 'SOUND',
+                        'materials': set(),
+                        'objects': set(),
+                        'node_names': set()
+                    }
+        
+        # Scan for missing CACHE files
+        for obj in bpy.data.objects:
+            # Check modifiers
+            for modifier in obj.modifiers:
+                if hasattr(modifier, 'filepath'):
+                    filepath = modifier.filepath
+                    if filepath and not os.path.exists(bpy.path.abspath(filepath)):
+                        if filepath not in missing_files:
+                            missing_files[filepath] = {
+                                'file_name': os.path.basename(filepath),
+                                'file_type': 'CACHE',
+                                'materials': set(),
+                                'objects': {obj.name},
+                                'node_names': set()
+                            }
+        
+        # Add to the collection property
+        for filepath, data in missing_files.items():
+            item = context.scene.missing_files.add()
+            item.filepath = filepath
+            item.file_name = data['file_name']
+            item.file_type = data['file_type']
+            item.material_names = ", ".join(sorted(data['materials'])) if data['materials'] else "(none)"
+            item.object_names = ", ".join(sorted(data['objects'])) if data['objects'] else "(unused)"
+            item.node_names = ", ".join(sorted(data['node_names'])) if data['node_names'] else "(none)"
+            item.is_used = len(data['objects']) > 0
+        
+        self.report({'INFO'}, f"Found {len(missing_files)} missing files")
+        return {'FINISHED'}
+
+
+class FILE_OT_relink_single(Operator):
+    """Relink a single missing file and auto-relink other files in the same directory"""
+    bl_idname = "file.relink_single"
+    bl_label = "Relink File"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    index: IntProperty()
+    
+    def invoke(self, context, event):
+        item = context.scene.missing_files[self.index]
+        
+        if not item.new_filepath:
+            self.report({'ERROR'}, "Please specify a new file path")
+            return {'CANCELLED'}
+        
+        # Check if path exists
+        new_path = bpy.path.abspath(item.new_filepath)
+        
+        # If it's a folder, proceed directly to execute (no warning needed)
+        if os.path.isdir(new_path):
+            return self.execute(context)
+        
+        # If file doesn't exist, show error
+        if not os.path.exists(new_path):
+            self.report({'ERROR'}, f"File does not exist: {new_path}")
+            return {'CANCELLED'}
+        
+        # It's a file - check for name/type differences
+        old_filename = os.path.basename(item.filepath)
+        old_name, old_ext = os.path.splitext(old_filename)
+        
+        new_filename = os.path.basename(item.new_filepath)
+        new_name, new_ext = os.path.splitext(new_filename)
+        
+        # Check for differences
+        name_different = old_name.lower() != new_name.lower()
+        ext_different = old_ext.lower() != new_ext.lower()
+        
+        # If different, show warning with custom dialog
+        if name_different or ext_different:
+            return context.window_manager.invoke_props_dialog(self, width=450)
+        
+        # No differences, proceed directly
+        return self.execute(context)
+    
+    def draw(self, context):
+        item = context.scene.missing_files[self.index]
+        layout = self.layout
+        
+        old_filename = os.path.basename(item.filepath)
+        old_name, old_ext = os.path.splitext(old_filename)
+        
+        # Get the actual new filepath (resolve if it's a folder)
+        new_path = bpy.path.abspath(item.new_filepath)
+        if os.path.isdir(new_path):
+            # If it's a folder, the actual file would be the original filename in that folder
+            new_filename = old_filename
+        else:
+            new_filename = os.path.basename(item.new_filepath)
+        
+        new_name, new_ext = os.path.splitext(new_filename)
+        
+        layout.label(text="Warning: File mismatch detected!", icon='ERROR')
+        layout.separator()
+        
+        # Show differences
+        if old_name.lower() != new_name.lower():
+            box = layout.box()
+            box.label(text="Different filename:", icon='INFO')
+            col = box.column(align=True)
+            col.label(text=f"  Original: {old_name}")
+            col.label(text=f"  New:      {new_name}")
+        
+        if old_ext.lower() != new_ext.lower():
+            box = layout.box()
+            box.label(text="Different file type:", icon='INFO')
+            col = box.column(align=True)
+            col.label(text=f"  Original: {old_ext.upper() if old_ext else '(none)'}")
+            col.label(text=f"  New:      {new_ext.upper() if new_ext else '(none)'}")
+        
+        layout.separator()
+        layout.label(text="Are you sure you want to relink?")
+    
+    def execute(self, context):
+        item = context.scene.missing_files[self.index]
+        
+        if not item.new_filepath:
+            self.report({'ERROR'}, "Please specify a new file path")
+            return {'CANCELLED'}
+        
+        new_path = bpy.path.abspath(item.new_filepath)
+        
+        # If user selected a folder, look for the file with the same name in that folder
+        if os.path.isdir(new_path):
+            original_filename = os.path.basename(item.filepath)
+            new_path = os.path.join(new_path, original_filename)
+            
+            if os.path.exists(new_path):
+                # Update the new_filepath to the actual file
+                try:
+                    item.new_filepath = bpy.path.relpath(new_path)
+                except:
+                    item.new_filepath = new_path
+                self.report({'INFO'}, f"Found file in selected folder: {original_filename}")
+            else:
+                self.report({'ERROR'}, f"File '{original_filename}' not found in selected folder")
+                return {'CANCELLED'}
+        elif not os.path.exists(new_path):
+            self.report({'ERROR'}, f"File does not exist: {new_path}")
+            return {'CANCELLED'}
+        
+        old_filepath = item.filepath
+        updated_count = 0
+        
+        # Update images
+        for image in bpy.data.images:
+            if image.filepath == old_filepath:
+                try:
+                    image.filepath = item.new_filepath
+                    image.reload()
+                    updated_count += 1
+                except Exception as e:
+                    self.report({'ERROR'}, f"Failed to reload image: {str(e)}")
+                    return {'CANCELLED'}
+        
+        # Update movie clips
+        for clip in bpy.data.movieclips:
+            if clip.filepath == old_filepath:
+                try:
+                    clip.filepath = item.new_filepath
+                    updated_count += 1
+                except Exception as e:
+                    self.report({'ERROR'}, f"Failed to update movie clip: {str(e)}")
+        
+        # Update sounds
+        for sound in bpy.data.sounds:
+            if sound.filepath == old_filepath:
+                try:
+                    sound.filepath = item.new_filepath
+                    updated_count += 1
+                except Exception as e:
+                    self.report({'ERROR'}, f"Failed to update sound: {str(e)}")
+        
+        # Update cache file modifiers
+        for obj in bpy.data.objects:
+            for modifier in obj.modifiers:
+                if hasattr(modifier, 'filepath') and modifier.filepath == old_filepath:
+                    try:
+                        modifier.filepath = item.new_filepath
+                        updated_count += 1
+                    except Exception as e:
+                        self.report({'ERROR'}, f"Failed to update cache: {str(e)}")
+        
+        # AUTO-RELINK: Check if there are other missing files in the same directory
+        new_directory = os.path.dirname(bpy.path.abspath(item.new_filepath))
+        auto_relinked = 0
+        
+        for other_item in context.scene.missing_files:
+            if other_item.filepath == old_filepath:
+                continue  # Skip the one we just relinked
+            
+            # Get the filename of the missing file
+            missing_filename = os.path.basename(other_item.filepath)
+            potential_path = os.path.join(new_directory, missing_filename)
+            
+            # Check if this file exists in the same directory
+            if os.path.exists(potential_path):
+                # Convert to relative path if possible
+                try:
+                    relative_path = bpy.path.relpath(potential_path)
+                except:
+                    relative_path = potential_path
+                
+                # Relink this file automatically
+                old_path = other_item.filepath
+                
+                # Update all datablocks with this filepath
+                for image in bpy.data.images:
+                    if image.filepath == old_path:
+                        try:
+                            image.filepath = relative_path
+                            image.reload()
+                            auto_relinked += 1
+                        except:
+                            pass
+                
+                for clip in bpy.data.movieclips:
+                    if clip.filepath == old_path:
+                        try:
+                            clip.filepath = relative_path
+                            auto_relinked += 1
+                        except:
+                            pass
+                
+                for sound in bpy.data.sounds:
+                    if sound.filepath == old_path:
+                        try:
+                            sound.filepath = relative_path
+                            auto_relinked += 1
+                        except:
+                            pass
+                
+                for obj in bpy.data.objects:
+                    for modifier in obj.modifiers:
+                        if hasattr(modifier, 'filepath') and modifier.filepath == old_path:
+                            try:
+                                modifier.filepath = relative_path
+                                auto_relinked += 1
+                            except:
+                                pass
+        
+        if auto_relinked > 0:
+            self.report({'INFO'}, f"Relinked {updated_count} file(s) + auto-relinked {auto_relinked} other file(s) from same directory")
+        else:
+            self.report({'INFO'}, f"Relinked {updated_count} file(s)")
+        
+        # Re-scan to update the list
+        bpy.ops.file.scan_missing()
+        
+        return {'FINISHED'}
+
+
+class TEXTURE_OT_browse_file(Operator):
+    """Browse for a texture file"""
+    bl_idname = "texture.browse_file"
+    bl_label = "Browse"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filepath: StringProperty(subtype='FILE_PATH')
+    index: IntProperty()
+    
+    def execute(self, context):
+        item = context.scene.missing_textures[self.index]
+        item.new_filepath = self.filepath
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class FILE_OT_auto_search(Operator):
+    """Search for missing file in common folders"""
+    bl_idname = "file.auto_search"
+    bl_label = "Auto Search"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    index: IntProperty()
+    
+    def execute(self, context):
+        item = context.scene.missing_files[self.index]
+        
+        # Get the filename from the original path
+        original_filename = os.path.basename(item.filepath)
+        
+        if not original_filename:
+            self.report({'ERROR'}, "Cannot extract filename from path")
+            return {'CANCELLED'}
+        
+        # Search locations
+        search_paths = []
+        
+        # Add blend file directory
+        if bpy.data.filepath:
+            blend_dir = os.path.dirname(bpy.data.filepath)
+            search_paths.append(blend_dir)
+            
+            # Add common subdirectories
+            for subdir in ['textures', 'Textures', 'tex', 'images', 'Images', 'maps', 'Maps']:
+                subdir_path = os.path.join(blend_dir, subdir)
+                if os.path.exists(subdir_path):
+                    search_paths.append(subdir_path)
+        
+        # Search for the file
+        for search_path in search_paths:
+            for root, dirs, files in os.walk(search_path):
+                if original_filename in files:
+                    found_path = os.path.join(root, original_filename)
+                    # Convert to relative path if possible
+                    if bpy.data.filepath:
+                        try:
+                            found_path = bpy.path.relpath(found_path)
+                        except:
+                            pass
+                    item.new_filepath = found_path
+                    self.report({'INFO'}, f"Found: {found_path}")
+                    return {'FINISHED'}
+        
+        self.report({'WARNING'}, f"Could not find '{original_filename}' in common locations")
+        return {'CANCELLED'}
+
+
+class FILE_OT_remove_file(Operator):
+    """Remove the unused file datablock from the blend file"""
+    bl_idname = "file.remove_file"
+    bl_label = "Remove File"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    index: IntProperty()
+    
+    def execute(self, context):
+        item = context.scene.missing_files[self.index]
+        
+        removed_count = 0
+        
+        # Remove images
+        images_to_remove = [img for img in bpy.data.images if img.filepath == item.filepath]
+        for image in images_to_remove:
+            bpy.data.images.remove(image)
+            removed_count += 1
+        
+        # Remove movie clips
+        clips_to_remove = [clip for clip in bpy.data.movieclips if clip.filepath == item.filepath]
+        for clip in clips_to_remove:
+            bpy.data.movieclips.remove(clip)
+            removed_count += 1
+        
+        # Remove sounds
+        sounds_to_remove = [sound for sound in bpy.data.sounds if sound.filepath == item.filepath]
+        for sound in sounds_to_remove:
+            bpy.data.sounds.remove(sound)
+            removed_count += 1
+        
+        self.report({'INFO'}, f"Removed {removed_count} file datablock(s)")
+        
+        # Re-scan to update the list
+        bpy.ops.file.scan_missing()
+        
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        item = context.scene.missing_files[self.index]
+        if item.is_used:
+            return context.window_manager.invoke_confirm(self, event)
+        return self.execute(context)
+    
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="This file is used in the scene!")
+        layout.label(text="Are you sure you want to remove it?")
+
+
+class FILE_OT_purge_all_orphans(Operator):
+    """Remove ALL orphaned data including objects not in any scene (more thorough than Blender's built-in purge)"""
+    bl_idname = "file.purge_all_orphans"
+    bl_label = "Purge All Orphans"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        removed_count = 0
+        
+        # Step 0: Run Blender's built-in recursive purge first
+        # This removes standard orphaned datablocks (meshes, materials, images with 0 users)
+        bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        
+        # Step 1: Now remove objects not in any scene (Blender's purge doesn't do this)
+        objects_to_remove = []
+        for obj in bpy.data.objects:
+            in_scene = False
+            for scene in bpy.data.scenes:
+                try:
+                    if obj.name in scene.objects.keys():
+                        in_scene = True
+                        break
+                except:
+                    pass
+            
+            if not in_scene:
+                objects_to_remove.append(obj)
+        
+        for obj in objects_to_remove:
+            bpy.data.objects.remove(obj)
+            removed_count += 1
+        
+        # Step 2: Run Blender's purge again to clean up anything freed by removing those objects
+        bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        
+        # Step 3: Final cleanup - remove any remaining orphaned datablocks
+        # (This is redundant after recursive purge, but ensures everything is clean)
+        
+        # Remove orphaned meshes
+        meshes_to_remove = []
+        for mesh in bpy.data.meshes:
+            if mesh.users == 0:
+                meshes_to_remove.append(mesh)
+        
+        for mesh in meshes_to_remove:
+            bpy.data.meshes.remove(mesh)
+            removed_count += 1
+        
+        # Remove orphaned materials
+        materials_to_remove = []
+        for mat in bpy.data.materials:
+            if mat.users == 0:
+                materials_to_remove.append(mat)
+        
+        for mat in materials_to_remove:
+            bpy.data.materials.remove(mat)
+            removed_count += 1
+        
+        # Remove orphaned images
+        images_to_remove = []
+        for img in bpy.data.images:
+            if img.users == 0:
+                images_to_remove.append(img)
+        
+        for img in images_to_remove:
+            bpy.data.images.remove(img)
+            removed_count += 1
+        
+        # Remove orphaned sounds
+        sounds_to_remove = []
+        for sound in bpy.data.sounds:
+            if sound.users == 0:
+                sounds_to_remove.append(sound)
+        
+        for sound in sounds_to_remove:
+            bpy.data.sounds.remove(sound)
+            removed_count += 1
+        
+        # Remove orphaned movie clips
+        clips_to_remove = []
+        for clip in bpy.data.movieclips:
+            if clip.users == 0:
+                clips_to_remove.append(clip)
+        
+        for clip in clips_to_remove:
+            bpy.data.movieclips.remove(clip)
+            removed_count += 1
+        
+        if removed_count > 0:
+            self.report({'INFO'}, f"Purged all orphaned data + removed {removed_count} object(s) not in any scene")
+        else:
+            self.report({'INFO'}, f"Purged all orphaned data (file is clean)")
+        
+        # Re-scan to update the list
+        bpy.ops.file.scan_missing()
+        
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+    
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="This will perform:")
+        layout.label(text="1. Blender's recursive purge (standard cleanup)")
+        layout.label(text="2. Remove objects not in any scene")
+        layout.label(text="3. Final cleanup pass")
+        layout.separator()
+        layout.label(text="Are you sure?")
+
+
+class FILE_OT_export_report(Operator):
+    """Export missing files report to a text file"""
+    bl_idname = "file.export_report"
+    bl_label = "Export Report"
+    bl_options = {'REGISTER'}
+    
+    def execute(self, context):
+        if not bpy.data.filepath:
+            self.report({'ERROR'}, "Save your .blend file first")
+            return {'CANCELLED'}
+        
+        blend_dir = os.path.dirname(bpy.data.filepath)
+        report_path = os.path.join(blend_dir, "missing_files_report.txt")
+        
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("MISSING FILES REPORT\n")
+                f.write(f"Blender File: {bpy.data.filepath}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for idx, item in enumerate(context.scene.missing_files, 1):
+                    f.write(f"{idx}. MISSING FILE:\n")
+                    f.write(f"   File Name: {item.file_name}\n")
+                    f.write(f"   File Type: {item.file_type}\n")
+                    f.write(f"   Original Path: {item.filepath}\n")
+                    f.write(f"   Used in Materials: {item.material_names}\n")
+                    f.write(f"   Assigned to Objects: {item.object_names}\n")
+                    f.write(f"   Node Names: {item.node_names}\n\n")
+                
+                f.write("=" * 80 + "\n")
+                f.write(f"Total missing files: {len(context.scene.missing_files)}\n")
+                f.write("=" * 80 + "\n")
+            
+            self.report({'INFO'}, f"Report exported to: {report_path}")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to export report: {str(e)}")
+            return {'CANCELLED'}
+        
+        return {'FINISHED'}
+
+
+class FILE_PT_missing_panel_shader(Panel):
+    """Panel for managing missing files in Shader Editor"""
+    bl_label = "BB Missing File Manager"
+    bl_idname = "FILE_PT_missing_panel_shader"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = 'BB Missing Files'
+    
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        settings = scene.missing_file_settings
+        
+        # Purge All Orphans button (at the very top - clean first!)
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator("file.purge_all_orphans", icon='TRASH')
+        
+        # Scan button
+        row = layout.row()
+        row.scale_y = 1.5
+        row.operator("file.scan_missing", icon='VIEWZOOM')
+        
+        # Export button
+        row = layout.row()
+        row.operator("file.export_report", icon='EXPORT')
+        
+        # Filter buttons
+        row = layout.row(align=True)
+        row.prop(settings, "show_used", text="Used", toggle=True, icon='CHECKMARK')
+        row.prop(settings, "show_unused", text="Unused", toggle=True, icon='X')
+        
+        layout.separator()
+        
+        # Display missing files
+        if len(scene.missing_files) == 0:
+            box = layout.box()
+            box.label(text="No missing files found", icon='CHECKMARK')
+            box.label(text="Click 'Scan' to check for issues")
+        else:
+            # Count filtered files
+            filtered_files = [item for item in scene.missing_files 
+                            if (item.is_used and settings.show_used) or 
+                               (not item.is_used and settings.show_unused)]
+            
+            layout.label(text=f"Missing Files: {len(scene.missing_files)} (Showing: {len(filtered_files)})", icon='ERROR')
+            
+            for idx, item in enumerate(scene.missing_files):
+                # Apply filter
+                if item.is_used and not settings.show_used:
+                    continue
+                if not item.is_used and not settings.show_unused:
+                    continue
+                
+                box = layout.box()
+                
+                # File info
+                col = box.column(align=True)
+                
+                # Status indicator row
+                status_row = col.row(align=True)
+                if item.is_used:
+                    status_row.label(text="Status: USED IN SCENE", icon='CHECKMARK')
+                else:
+                    status_row.label(text="Status: UNUSED", icon='X')
+                
+                # File type and name
+                col.label(text=f"Type: {item.file_type}", icon='FILE')
+                col.label(text=f"File: {item.file_name}", icon='TEXTURE')
+                
+                # Original path (split into multiple lines if too long)
+                split_box = col.box()
+                split_col = split_box.column(align=True)
+                split_col.scale_y = 0.7
+                split_col.label(text="Original Path:")
+                
+                # Split long paths
+                path_parts = item.filepath.split(os.sep)
+                if len(path_parts) > 3:
+                    split_col.label(text="..." + os.sep + os.sep.join(path_parts[-3:]))
+                else:
+                    split_col.label(text=item.filepath)
+                
+                split_col.label(text=f"Materials: {item.material_names}")
+                split_col.label(text=f"Objects: {item.object_names}")
+                
+                col.separator(factor=0.5)
+                
+                # If used, show relink options
+                if item.is_used:
+                    # New path input
+                    col.prop(item, "new_filepath", text="New Path")
+                    
+                    # Relink button
+                    row = col.row()
+                    row.scale_y = 1.3
+                    op = row.operator("file.relink_single", text="Relink This File", icon='LINKED')
+                    op.index = idx
+                    
+                    # Auto Find and Delete buttons side by side
+                    row = col.row(align=True)
+                    op = row.operator("file.auto_search", text="Auto Find", icon='VIEWZOOM')
+                    op.index = idx
+                    op = row.operator("file.remove_file", text="Delete", icon='TRASH')
+                    op.index = idx
+                else:
+                    # If unused, show remove button
+                    col.label(text="This file is not used in any objects")
+                    row = col.row()
+                    row.scale_y = 1.3
+                    op = row.operator("file.remove_file", text="Remove from File", icon='TRASH')
+                    op.index = idx
+                
+                layout.separator()
+
+
+classes = (
+    MissingFileItem,
+    MissingFileSettings,
+    FILE_OT_scan_missing,
+    FILE_OT_relink_single,
+    FILE_OT_auto_search,
+    FILE_OT_remove_file,
+    FILE_OT_purge_all_orphans,
+    FILE_OT_export_report,
+    FILE_PT_missing_panel_shader,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    
+    bpy.types.Scene.missing_files = bpy.props.CollectionProperty(type=MissingFileItem)
+    bpy.types.Scene.missing_file_settings = bpy.props.PointerProperty(type=MissingFileSettings)
+
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    
+    del bpy.types.Scene.missing_files
+    del bpy.types.Scene.missing_file_settings
+
+
+if __name__ == "__main__":
+    register()

@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "bb_missing_file_manager"
+version = "1.0.0"
+name = "BB Missing File Manager"
+tagline = "Manage and relink all missing files in your scene"
+maintainer = "Blender Bob & Claude.ai"
+type = "add-on"
+
+tags = ["Material", "Import-Export", "Scene"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Access to read and write file paths"
