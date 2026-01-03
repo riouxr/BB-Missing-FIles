@@ -64,6 +64,10 @@ class FILE_OT_scan_missing(Operator):
                     if node.type == 'TEX_IMAGE' and node.image:
                         image = node.image
                         
+                        # Skip packed images - they're embedded in the file, not missing!
+                        if image.packed_file is not None:
+                            continue
+                        
                         if image.filepath and not os.path.exists(bpy.path.abspath(image.filepath)):
                             filepath = image.filepath
                             
@@ -90,6 +94,10 @@ class FILE_OT_scan_missing(Operator):
                 for node in material.node_tree.nodes:
                     if node.type == 'TEX_IMAGE' and node.image and node.image.source == 'MOVIE':
                         image = node.image
+                        
+                        # Skip packed movie files
+                        if image.packed_file is not None:
+                            continue
                         
                         if image.filepath and not os.path.exists(bpy.path.abspath(image.filepath)):
                             filepath = image.filepath
@@ -252,20 +260,34 @@ class FILE_OT_relink_single(Operator):
         
         new_path = bpy.path.abspath(item.new_filepath)
         
-        # If user selected a folder, look for the file with the same name in that folder
-        if os.path.isdir(new_path):
+        # Remember if this was a folder selection (before we modify new_filepath)
+        was_folder_selection = os.path.isdir(new_path)
+        original_search_root = new_path if was_folder_selection else None
+        
+        # If user selected a folder, look for the file with the same name recursively
+        if was_folder_selection:
             original_filename = os.path.basename(item.filepath)
-            new_path = os.path.join(new_path, original_filename)
+            found_path = None
             
-            if os.path.exists(new_path):
+            # Search recursively through all subfolders
+            for root, dirs, files in os.walk(new_path):
+                if original_filename in files:
+                    found_path = os.path.join(root, original_filename)
+                    break
+            
+            if found_path:
                 # Update the new_filepath to the actual file
                 try:
-                    item.new_filepath = bpy.path.relpath(new_path)
+                    item.new_filepath = bpy.path.relpath(found_path)
                 except:
-                    item.new_filepath = new_path
-                self.report({'INFO'}, f"Found file in selected folder: {original_filename}")
+                    item.new_filepath = found_path
+                
+                # Show relative path from selected folder
+                rel_to_selected = os.path.relpath(found_path, new_path)
+                self.report({'INFO'}, f"Found file: {rel_to_selected}")
+                new_path = found_path
             else:
-                self.report({'ERROR'}, f"File '{original_filename}' not found in selected folder")
+                self.report({'ERROR'}, f"File '{original_filename}' not found in selected folder or subfolders")
                 return {'CANCELLED'}
         elif not os.path.exists(new_path):
             self.report({'ERROR'}, f"File does not exist: {new_path}")
@@ -275,8 +297,14 @@ class FILE_OT_relink_single(Operator):
         updated_count = 0
         
         # Update images
+        linked_count = 0
         for image in bpy.data.images:
             if image.filepath == old_filepath:
+                # Check if this is a linked datablock (read-only)
+                if image.library is not None:
+                    print(f"DEBUG: Skipping linked image: {image.name} from library: {image.library.filepath}")
+                    linked_count += 1
+                    continue  # Skip linked datablocks
                 try:
                     image.filepath = item.new_filepath
                     image.reload()
@@ -288,6 +316,9 @@ class FILE_OT_relink_single(Operator):
         # Update movie clips
         for clip in bpy.data.movieclips:
             if clip.filepath == old_filepath:
+                if clip.library is not None:
+                    linked_count += 1
+                    continue
                 try:
                     clip.filepath = item.new_filepath
                     updated_count += 1
@@ -297,6 +328,9 @@ class FILE_OT_relink_single(Operator):
         # Update sounds
         for sound in bpy.data.sounds:
             if sound.filepath == old_filepath:
+                if sound.library is not None:
+                    linked_count += 1
+                    continue
                 try:
                     sound.filepath = item.new_filepath
                     updated_count += 1
@@ -313,9 +347,16 @@ class FILE_OT_relink_single(Operator):
                     except Exception as e:
                         self.report({'ERROR'}, f"Failed to update cache: {str(e)}")
         
-        # AUTO-RELINK: Check if there are other missing files in the same directory
+        # AUTO-RELINK: Check if there are other missing files
+        # If we used folder selection, search the entire folder tree
         new_directory = os.path.dirname(bpy.path.abspath(item.new_filepath))
         auto_relinked = 0
+        
+        # Use the original folder if it was a folder selection, otherwise just the file's directory
+        if original_search_root:
+            search_root = original_search_root
+        else:
+            search_root = new_directory
         
         for other_item in context.scene.missing_files:
             if other_item.filepath == old_filepath:
@@ -323,15 +364,21 @@ class FILE_OT_relink_single(Operator):
             
             # Get the filename of the missing file
             missing_filename = os.path.basename(other_item.filepath)
-            potential_path = os.path.join(new_directory, missing_filename)
             
-            # Check if this file exists in the same directory
-            if os.path.exists(potential_path):
+            # Search recursively in the root folder
+            found_path = None
+            for root, dirs, files in os.walk(search_root):
+                if missing_filename in files:
+                    found_path = os.path.join(root, missing_filename)
+                    break
+            
+            # If we found the file somewhere, relink it
+            if found_path:
                 # Convert to relative path if possible
                 try:
-                    relative_path = bpy.path.relpath(potential_path)
+                    relative_path = bpy.path.relpath(found_path)
                 except:
-                    relative_path = potential_path
+                    relative_path = found_path
                 
                 # Relink this file automatically
                 old_path = other_item.filepath
@@ -371,10 +418,15 @@ class FILE_OT_relink_single(Operator):
                             except:
                                 pass
         
+        # Build success message
+        message = f"Relinked {updated_count} file(s)"
         if auto_relinked > 0:
-            self.report({'INFO'}, f"Relinked {updated_count} file(s) + auto-relinked {auto_relinked} other file(s) from same directory")
+            message += f" + auto-relinked {auto_relinked} other file(s)"
+        if linked_count > 0:
+            message += f" (WARNING: {linked_count} linked file(s) skipped - they're read-only)"
+            self.report({'WARNING'}, message)
         else:
-            self.report({'INFO'}, f"Relinked {updated_count} file(s)")
+            self.report({'INFO'}, message)
         
         # Re-scan to update the list
         bpy.ops.file.scan_missing()
