@@ -1,7 +1,7 @@
 bl_info = {
     "name": "BB Missing File Manager",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 0, 4),
+    "version": (1, 0, 5),
     "blender": (3, 0, 0),
     "location": "Shader Editor > Sidebar > Missing Files",
     "description": "Manage and relink all missing files (textures, videos, sounds, etc.) in your scene",
@@ -10,8 +10,45 @@ bl_info = {
 
 import bpy
 import os
+import glob
 from bpy.props import StringProperty, IntProperty, BoolProperty
 from bpy.types import Operator, Panel, PropertyGroup
+
+
+def check_udim_exists(filepath):
+    """Check if a UDIM texture exists by looking for any tile (1001, 1002, etc.)"""
+    if "<UDIM>" not in filepath:
+        # Not a UDIM texture, check normally
+        return os.path.exists(bpy.path.abspath(filepath))
+    
+    # Replace <UDIM> with glob pattern to find any tile
+    abs_path = bpy.path.abspath(filepath)
+    pattern = abs_path.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
+    
+    # Check if any files match the pattern
+    matches = glob.glob(pattern)
+    return len(matches) > 0
+
+
+def find_udim_file(filepath, search_directory):
+    """Find a UDIM texture in the search directory"""
+    if "<UDIM>" not in filepath:
+        # Not a UDIM texture, check normally
+        filename = os.path.basename(filepath)
+        potential_path = os.path.join(search_directory, filename)
+        return potential_path if os.path.exists(potential_path) else None
+    
+    # For UDIM textures, search for any tile
+    filename = os.path.basename(filepath)
+    pattern_filename = filename.replace("<UDIM>", "[0-9][0-9][0-9][0-9]")
+    pattern = os.path.join(search_directory, pattern_filename)
+    
+    matches = glob.glob(pattern)
+    if matches:
+        # Return the path with <UDIM> placeholder, not a specific tile
+        return os.path.join(search_directory, filename)
+    
+    return None
 
 
 class MissingFileItem(PropertyGroup):
@@ -78,7 +115,7 @@ class FILE_OT_scan_missing(Operator):
                         if image.packed_file is not None:
                             continue
                         
-                        if image.filepath and not os.path.exists(bpy.path.abspath(image.filepath)):
+                        if image.filepath and not check_udim_exists(image.filepath):
                             filepath = image.filepath
                             
                             if filepath not in missing_files:
@@ -115,7 +152,7 @@ class FILE_OT_scan_missing(Operator):
                         if image.packed_file is not None:
                             continue
                         
-                        if image.filepath and not os.path.exists(bpy.path.abspath(image.filepath)):
+                        if image.filepath and not check_udim_exists(image.filepath):
                             filepath = image.filepath
                             
                             if filepath not in missing_files:
@@ -219,10 +256,17 @@ class FILE_OT_relink_single(Operator):
         if os.path.isdir(new_path):
             return self.execute(context)
         
-        # If file doesn't exist, show error
-        if not os.path.exists(new_path):
-            self.report({'ERROR'}, f"File does not exist: {new_path}")
-            return {'CANCELLED'}
+        # Check if file exists (handle UDIM patterns)
+        if "<UDIM>" in item.new_filepath:
+            # For UDIM, check if any tiles exist
+            if not check_udim_exists(item.new_filepath):
+                self.report({'ERROR'}, f"No UDIM tiles found for: {new_path}")
+                return {'CANCELLED'}
+        else:
+            # Regular file check
+            if not os.path.exists(new_path):
+                self.report({'ERROR'}, f"File does not exist: {new_path}")
+                return {'CANCELLED'}
         
         # It's a file - check for name/type differences
         old_filename = os.path.basename(item.filepath)
@@ -299,7 +343,10 @@ class FILE_OT_relink_single(Operator):
             original_filename = os.path.basename(item.filepath)
             new_path = os.path.join(new_path, original_filename)
             
-            if os.path.exists(new_path):
+            # Check existence (handle UDIM)
+            file_exists = check_udim_exists(new_path) if "<UDIM>" in new_path else os.path.exists(new_path)
+            
+            if file_exists:
                 # Update the new_filepath to the actual file
                 try:
                     item.new_filepath = bpy.path.relpath(new_path)
@@ -309,9 +356,12 @@ class FILE_OT_relink_single(Operator):
             else:
                 self.report({'ERROR'}, f"File '{original_filename}' not found in selected folder")
                 return {'CANCELLED'}
-        elif not os.path.exists(new_path):
-            self.report({'ERROR'}, f"File does not exist: {new_path}")
-            return {'CANCELLED'}
+        else:
+            # Check existence (handle UDIM)
+            file_exists = check_udim_exists(item.new_filepath) if "<UDIM>" in item.new_filepath else os.path.exists(new_path)
+            if not file_exists:
+                self.report({'ERROR'}, f"File does not exist: {new_path}")
+                return {'CANCELLED'}
         
         old_filepath = item.filepath
         updated_count = 0
@@ -375,17 +425,15 @@ class FILE_OT_relink_single(Operator):
             if other_item.filepath == old_filepath:
                 continue  # Skip the one we just relinked
             
-            # Get the filename of the missing file
-            missing_filename = os.path.basename(other_item.filepath)
-            potential_path = os.path.join(new_directory, missing_filename)
+            # Use UDIM-aware search
+            found_path = find_udim_file(other_item.filepath, new_directory)
             
-            # Check if this file exists in the same directory
-            if os.path.exists(potential_path):
+            if found_path:
                 # Convert to relative path if possible
                 try:
-                    relative_path = bpy.path.relpath(potential_path)
+                    relative_path = bpy.path.relpath(found_path)
                 except:
-                    relative_path = potential_path
+                    relative_path = found_path
                 
                 # Relink this file automatically
                 old_path = other_item.filepath
@@ -492,11 +540,26 @@ class FILE_OT_auto_search(Operator):
                 if os.path.exists(subdir_path):
                     search_paths.append(subdir_path)
         
-        # Search for the file
+        # Search for the file (with UDIM support)
         for search_path in search_paths:
+            # Use UDIM-aware search
+            found_path = find_udim_file(item.filepath, search_path)
+            
+            if found_path:
+                # Convert to relative path if possible
+                if bpy.data.filepath:
+                    try:
+                        found_path = bpy.path.relpath(found_path)
+                    except:
+                        pass
+                item.new_filepath = found_path
+                self.report({'INFO'}, f"Found: {found_path}")
+                return {'FINISHED'}
+            
+            # Also search subdirectories
             for root, dirs, files in os.walk(search_path):
-                if original_filename in files:
-                    found_path = os.path.join(root, original_filename)
+                found_path = find_udim_file(item.filepath, root)
+                if found_path:
                     # Convert to relative path if possible
                     if bpy.data.filepath:
                         try:
