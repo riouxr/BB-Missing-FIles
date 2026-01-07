@@ -1,7 +1,7 @@
 bl_info = {
     "name": "BB Missing File Manager",
     "author": "Blender Bob & Claude.ai",
-    "version": (1, 0, 5),
+    "version": (1, 0, 9),
     "blender": (3, 0, 0),
     "location": "Shader Editor > Sidebar > Missing Files",
     "description": "Manage and relink all missing files (textures, videos, sounds, etc.) in your scene",
@@ -190,11 +190,11 @@ class FILE_OT_scan_missing(Operator):
                         'node_names': set()
                     }
         
-        # Scan for missing CACHE files
+        # Scan for cache files (Alembic, USD, etc.)
         for obj in bpy.data.objects:
-            # Check modifiers
             for modifier in obj.modifiers:
-                if hasattr(modifier, 'filepath'):
+                # Check Mesh Cache modifier
+                if modifier.type == 'MESH_CACHE':
                     filepath = modifier.filepath
                     if filepath and not os.path.exists(bpy.path.abspath(filepath)):
                         # Get filename - handle cases where filepath is just a directory
@@ -338,24 +338,112 @@ class FILE_OT_relink_single(Operator):
         
         new_path = bpy.path.abspath(item.new_filepath)
         
-        # If user selected a folder, look for the file with the same name in that folder
+        # If user selected a folder, search recursively for all missing files
         if os.path.isdir(new_path):
-            original_filename = os.path.basename(item.filepath)
-            new_path = os.path.join(new_path, original_filename)
+            print("\n" + "="*80)
+            print("RELINK BUTTON - RECURSIVE FOLDER SEARCH")
+            print("="*80)
+            print(f"Searching folder: {new_path}")
+            print(f"Total missing files: {len(context.scene.missing_files)}")
+            print()
             
-            # Check existence (handle UDIM)
-            file_exists = check_udim_exists(new_path) if "<UDIM>" in new_path else os.path.exists(new_path)
+            # Dictionary to store found files: {missing_filepath: found_path}
+            found_files = {}
+            directories_searched = 0
             
-            if file_exists:
-                # Update the new_filepath to the actual file
-                try:
-                    item.new_filepath = bpy.path.relpath(new_path)
-                except:
-                    item.new_filepath = new_path
-                self.report({'INFO'}, f"Found file in selected folder: {original_filename}")
-            else:
-                self.report({'ERROR'}, f"File '{original_filename}' not found in selected folder")
+            # Search recursively through the entire folder
+            for root, dirs, files in os.walk(new_path):
+                directories_searched += 1
+                print(f"  [{directories_searched}] Checking: {root}")
+                
+                # Check each missing file
+                for missing_item in context.scene.missing_files:
+                    if missing_item.filepath in found_files:
+                        continue
+                    
+                    # Use UDIM-aware search
+                    found_path = find_udim_file(missing_item.filepath, root)
+                    
+                    if found_path:
+                        print(f"      ✓ FOUND: {os.path.basename(missing_item.filepath)}")
+                        # Convert to relative path if possible
+                        if bpy.data.filepath:
+                            try:
+                                found_path = bpy.path.relpath(found_path)
+                            except:
+                                pass
+                        found_files[missing_item.filepath] = found_path
+            
+            print(f"\nSearch complete!")
+            print(f"Directories searched: {directories_searched}")
+            print(f"Files found: {len(found_files)}")
+            print("="*80 + "\n")
+            
+            # Check if we found the primary file at least
+            if item.filepath not in found_files:
+                self.report({'ERROR'}, f"File '{os.path.basename(item.filepath)}' not found in selected folder or its subdirectories")
                 return {'CANCELLED'}
+            
+            # Relink all found files
+            relinked_count = 0
+            
+            for missing_item in context.scene.missing_files:
+                if missing_item.filepath not in found_files:
+                    continue
+                
+                found_path = found_files[missing_item.filepath]
+                old_filepath = missing_item.filepath
+                
+                # Update images
+                for image in bpy.data.images:
+                    if image.filepath == old_filepath and image.library is None:
+                        try:
+                            image.filepath = found_path
+                            image.reload()
+                            relinked_count += 1
+                        except:
+                            pass
+                
+                # Update movie clips
+                for clip in bpy.data.movieclips:
+                    if clip.filepath == old_filepath and clip.library is None:
+                        try:
+                            clip.filepath = found_path
+                            relinked_count += 1
+                        except:
+                            pass
+                
+                # Update sounds
+                for sound in bpy.data.sounds:
+                    if sound.filepath == old_filepath and sound.library is None:
+                        try:
+                            sound.filepath = found_path
+                            relinked_count += 1
+                        except:
+                            pass
+                
+                # Update cache modifiers
+                for obj in bpy.data.objects:
+                    for modifier in obj.modifiers:
+                        if hasattr(modifier, 'filepath') and modifier.filepath == old_filepath:
+                            try:
+                                modifier.filepath = found_path
+                                relinked_count += 1
+                            except:
+                                pass
+            
+            # Re-scan to update the list
+            bpy.ops.file.scan_missing()
+            
+            num_files = len(found_files)
+            if num_files == 1:
+                self.report({'INFO'}, f"Found and relinked 1 file ({relinked_count} datablock(s))")
+            else:
+                self.report({'INFO'}, f"Found and relinked {num_files} files ({relinked_count} datablock(s))")
+            
+            return {'FINISHED'}
+        
+        # If it's a specific file (not a folder), use the original logic
         else:
             # Check existence (handle UDIM)
             file_exists = check_udim_exists(item.new_filepath) if "<UDIM>" in item.new_filepath else os.path.exists(new_path)
@@ -407,7 +495,7 @@ class FILE_OT_relink_single(Operator):
                 except Exception as e:
                     self.report({'ERROR'}, f"Failed to update sound: {str(e)}")
         
-        # Update cache file modifiers
+        # Update cache modifiers
         for obj in bpy.data.objects:
             for modifier in obj.modifiers:
                 if hasattr(modifier, 'filepath') and modifier.filepath == old_filepath:
@@ -417,61 +505,66 @@ class FILE_OT_relink_single(Operator):
                     except Exception as e:
                         self.report({'ERROR'}, f"Failed to update cache: {str(e)}")
         
-        # AUTO-RELINK: Check if there are other missing files in the same directory
-        new_directory = os.path.dirname(bpy.path.abspath(item.new_filepath))
+        # Auto-relink other files in the same directory
+        new_dir = os.path.dirname(bpy.path.abspath(item.new_filepath))
         auto_relinked = 0
         
-        for other_item in context.scene.missing_files:
-            if other_item.filepath == old_filepath:
-                continue  # Skip the one we just relinked
-            
-            # Use UDIM-aware search
-            found_path = find_udim_file(other_item.filepath, new_directory)
-            
-            if found_path:
-                # Convert to relative path if possible
-                try:
-                    relative_path = bpy.path.relpath(found_path)
-                except:
-                    relative_path = found_path
+        if os.path.exists(new_dir):
+            # Get all missing files
+            for other_item in context.scene.missing_files:
+                if other_item.filepath == old_filepath:
+                    continue  # Skip the file we just relinked
                 
-                # Relink this file automatically
-                old_path = other_item.filepath
+                # Check if this file exists in the same directory
+                other_filename = os.path.basename(other_item.filepath)
+                potential_path = os.path.join(new_dir, other_filename)
                 
-                # Update all datablocks with this filepath
-                for image in bpy.data.images:
-                    if image.filepath == old_path:
-                        try:
-                            image.filepath = relative_path
-                            image.reload()
-                            auto_relinked += 1
-                        except:
-                            pass
+                # Check existence (handle UDIM)
+                file_exists = check_udim_exists(potential_path) if "<UDIM>" in potential_path else os.path.exists(potential_path)
                 
-                for clip in bpy.data.movieclips:
-                    if clip.filepath == old_path:
-                        try:
-                            clip.filepath = relative_path
-                            auto_relinked += 1
-                        except:
-                            pass
-                
-                for sound in bpy.data.sounds:
-                    if sound.filepath == old_path:
-                        try:
-                            sound.filepath = relative_path
-                            auto_relinked += 1
-                        except:
-                            pass
-                
-                for obj in bpy.data.objects:
-                    for modifier in obj.modifiers:
-                        if hasattr(modifier, 'filepath') and modifier.filepath == old_path:
+                if file_exists:
+                    # Convert to relative path
+                    try:
+                        relative_path = bpy.path.relpath(potential_path)
+                    except:
+                        relative_path = potential_path
+                    
+                    old_path = other_item.filepath
+                    
+                    # Update the datablocks
+                    for image in bpy.data.images:
+                        if image.filepath == old_path and image.library is None:
                             try:
-                                modifier.filepath = relative_path
+                                image.filepath = relative_path
+                                image.reload()
                                 auto_relinked += 1
                             except:
                                 pass
+                    
+                    for clip in bpy.data.movieclips:
+                        if clip.filepath == old_path:
+                            try:
+                                clip.filepath = relative_path
+                                auto_relinked += 1
+                            except:
+                                pass
+                    
+                    for sound in bpy.data.sounds:
+                        if sound.filepath == old_path:
+                            try:
+                                sound.filepath = relative_path
+                                auto_relinked += 1
+                            except:
+                                pass
+                    
+                    for obj in bpy.data.objects:
+                        for modifier in obj.modifiers:
+                            if hasattr(modifier, 'filepath') and modifier.filepath == old_path:
+                                try:
+                                    modifier.filepath = relative_path
+                                    auto_relinked += 1
+                                except:
+                                    pass
         
         # Build success message
         message = f"Relinked {updated_count} file(s)"
@@ -509,7 +602,7 @@ class TEXTURE_OT_browse_file(Operator):
 
 
 class FILE_OT_auto_search(Operator):
-    """Search for missing file in common folders"""
+    """Search recursively for all missing files in common folders and auto-relink them"""
     bl_idname = "file.auto_search"
     bl_label = "Auto Search"
     bl_options = {'REGISTER', 'UNDO'}
@@ -517,13 +610,24 @@ class FILE_OT_auto_search(Operator):
     index: IntProperty()
     
     def execute(self, context):
+        print("\n" + "="*80)
+        print("AUTO SEARCH OPERATOR CALLED!")
+        print("="*80)
+        
         item = context.scene.missing_files[self.index]
+        print(f"Looking for: {item.filepath}")
         
         # Get the filename from the original path
         original_filename = os.path.basename(item.filepath)
         
         if not original_filename:
             self.report({'ERROR'}, "Cannot extract filename from path")
+            return {'CANCELLED'}
+        
+        # Check if blend file is saved
+        if not bpy.data.filepath:
+            print("ERROR: Blend file is not saved!")
+            self.report({'ERROR'}, "Please save your blend file first! Auto search needs a base directory to search from.")
             return {'CANCELLED'}
         
         # Search locations
@@ -540,38 +644,129 @@ class FILE_OT_auto_search(Operator):
                 if os.path.exists(subdir_path):
                     search_paths.append(subdir_path)
         
-        # Search for the file (with UDIM support)
+        print("\n" + "="*80)
+        print("BB MISSING FILE MANAGER - AUTO SEARCH")
+        print("="*80)
+        print(f"Starting recursive search for missing files...")
+        print(f"Total missing files to search for: {len(context.scene.missing_files)}")
+        print(f"\nSearch paths configured: {len(search_paths)}")
+        for sp in search_paths:
+            print(f"  - {sp}")
+        print()
+        
+        # Dictionary to store found files: {missing_filepath: found_path}
+        found_files = {}
+        
+        # Search recursively through all locations
+        directories_searched = 0
         for search_path in search_paths:
-            # Use UDIM-aware search
-            found_path = find_udim_file(item.filepath, search_path)
+            print(f"Searching in: {search_path}")
+            # Walk through the entire directory tree
+            for root, dirs, files in os.walk(search_path):
+                directories_searched += 1
+                print(f"  [{directories_searched}] Checking: {root}")
+                
+                # Check each missing file to see if it exists in this directory
+                for missing_item in context.scene.missing_files:
+                    # Skip if we already found this file
+                    if missing_item.filepath in found_files:
+                        continue
+                    
+                    # Use UDIM-aware search
+                    found_path = find_udim_file(missing_item.filepath, root)
+                    
+                    if found_path:
+                        print(f"      ✓ FOUND: {os.path.basename(missing_item.filepath)} in {root}")
+                        # Convert to relative path if possible
+                        if bpy.data.filepath:
+                            try:
+                                found_path = bpy.path.relpath(found_path)
+                            except:
+                                pass
+                        found_files[missing_item.filepath] = found_path
+        
+        print(f"\nSearch complete!")
+        print(f"Directories searched: {directories_searched}")
+        print(f"Files found: {len(found_files)}")
+        if found_files:
+            print("\nFound files:")
+            for orig_path, new_path in found_files.items():
+                print(f"  {os.path.basename(orig_path)} -> {new_path}")
+        print("="*80 + "\n")
+        
+        # Now relink all found files
+        relinked_count = 0
+        primary_found = False
+        
+        for missing_item in context.scene.missing_files:
+            if missing_item.filepath not in found_files:
+                continue
             
-            if found_path:
-                # Convert to relative path if possible
-                if bpy.data.filepath:
+            found_path = found_files[missing_item.filepath]
+            
+            # Track if we found the primary file (the one the user clicked on)
+            if missing_item.filepath == item.filepath:
+                primary_found = True
+                missing_item.new_filepath = found_path
+            
+            print(f"Relinking: {os.path.basename(missing_item.filepath)}")
+            
+            # Relink all datablocks using this file
+            old_filepath = missing_item.filepath
+            
+            # Update images
+            for image in bpy.data.images:
+                if image.filepath == old_filepath and image.library is None:
                     try:
-                        found_path = bpy.path.relpath(found_path)
+                        image.filepath = found_path
+                        image.reload()
+                        relinked_count += 1
                     except:
                         pass
-                item.new_filepath = found_path
-                self.report({'INFO'}, f"Found: {found_path}")
-                return {'FINISHED'}
             
-            # Also search subdirectories
-            for root, dirs, files in os.walk(search_path):
-                found_path = find_udim_file(item.filepath, root)
-                if found_path:
-                    # Convert to relative path if possible
-                    if bpy.data.filepath:
+            # Update movie clips
+            for clip in bpy.data.movieclips:
+                if clip.filepath == old_filepath and clip.library is None:
+                    try:
+                        clip.filepath = found_path
+                        relinked_count += 1
+                    except:
+                        pass
+            
+            # Update sounds
+            for sound in bpy.data.sounds:
+                if sound.filepath == old_filepath and sound.library is None:
+                    try:
+                        sound.filepath = found_path
+                        relinked_count += 1
+                    except:
+                        pass
+            
+            # Update cache modifiers
+            for obj in bpy.data.objects:
+                for modifier in obj.modifiers:
+                    if hasattr(modifier, 'filepath') and modifier.filepath == old_filepath:
                         try:
-                            found_path = bpy.path.relpath(found_path)
+                            modifier.filepath = found_path
+                            relinked_count += 1
                         except:
                             pass
-                    item.new_filepath = found_path
-                    self.report({'INFO'}, f"Found: {found_path}")
-                    return {'FINISHED'}
         
-        self.report({'WARNING'}, f"Could not find '{original_filename}' in common locations")
-        return {'CANCELLED'}
+        # Re-scan to update the list
+        bpy.ops.file.scan_missing()
+        
+        # Report results
+        if not primary_found:
+            self.report({'WARNING'}, f"Could not find '{original_filename}' in common locations")
+            return {'CANCELLED'}
+        
+        num_files_found = len(found_files)
+        if num_files_found == 1:
+            self.report({'INFO'}, f"Found and relinked 1 file ({relinked_count} datablock(s))")
+        else:
+            self.report({'INFO'}, f"Found and relinked {num_files_found} files ({relinked_count} datablock(s))")
+        
+        return {'FINISHED'}
 
 
 class FILE_OT_remove_file(Operator):
@@ -653,73 +848,16 @@ class FILE_OT_purge_all_orphans(Operator):
                 objects_to_remove.append(obj)
         
         for obj in objects_to_remove:
-            bpy.data.objects.remove(obj)
-            removed_count += 1
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+                removed_count += 1
+            except:
+                pass
         
-        # Step 2: Run Blender's purge again to clean up anything freed by removing those objects
+        # Step 2: Run the built-in purge again to clean up dependencies
         bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
         
-        # Step 3: Final cleanup - remove any remaining orphaned datablocks
-        # (This is redundant after recursive purge, but ensures everything is clean)
-        
-        # Remove orphaned meshes
-        meshes_to_remove = []
-        for mesh in bpy.data.meshes:
-            if mesh.users == 0:
-                meshes_to_remove.append(mesh)
-        
-        for mesh in meshes_to_remove:
-            bpy.data.meshes.remove(mesh)
-            removed_count += 1
-        
-        # Remove orphaned materials
-        materials_to_remove = []
-        for mat in bpy.data.materials:
-            if mat.users == 0:
-                materials_to_remove.append(mat)
-        
-        for mat in materials_to_remove:
-            bpy.data.materials.remove(mat)
-            removed_count += 1
-        
-        # Remove orphaned images
-        images_to_remove = []
-        for img in bpy.data.images:
-            if img.users == 0:
-                images_to_remove.append(img)
-        
-        for img in images_to_remove:
-            bpy.data.images.remove(img)
-            removed_count += 1
-        
-        # Remove orphaned sounds
-        sounds_to_remove = []
-        for sound in bpy.data.sounds:
-            if sound.users == 0:
-                sounds_to_remove.append(sound)
-        
-        for sound in sounds_to_remove:
-            bpy.data.sounds.remove(sound)
-            removed_count += 1
-        
-        # Remove orphaned movie clips
-        clips_to_remove = []
-        for clip in bpy.data.movieclips:
-            if clip.users == 0:
-                clips_to_remove.append(clip)
-        
-        for clip in clips_to_remove:
-            bpy.data.movieclips.remove(clip)
-            removed_count += 1
-        
-        if removed_count > 0:
-            self.report({'INFO'}, f"Purged all orphaned data + removed {removed_count} object(s) not in any scene")
-        else:
-            self.report({'INFO'}, f"Purged all orphaned data (file is clean)")
-        
-        # Re-scan to update the list
-        bpy.ops.file.scan_missing()
-        
+        self.report({'INFO'}, f"Purged {removed_count} orphaned object(s) + standard orphaned data")
         return {'FINISHED'}
     
     def invoke(self, context, event):
@@ -727,78 +865,113 @@ class FILE_OT_purge_all_orphans(Operator):
     
     def draw(self, context):
         layout = self.layout
-        layout.label(text="This will perform:")
-        layout.label(text="1. Blender's recursive purge (standard cleanup)")
-        layout.label(text="2. Remove objects not in any scene")
-        layout.label(text="3. Final cleanup pass")
+        layout.label(text="This will remove ALL unused data:")
+        layout.label(text="- Objects not in any scene")
+        layout.label(text="- Materials, images, meshes with 0 users")
+        layout.label(text="- Other orphaned datablocks")
         layout.separator()
-        layout.label(text="Are you sure?")
+        layout.label(text="This cannot be easily undone!")
 
 
 class FILE_OT_export_report(Operator):
-    """Export missing files report to a text file"""
+    """Export a text file report of all missing files"""
     bl_idname = "file.export_report"
     bl_label = "Export Report"
     bl_options = {'REGISTER'}
     
+    filepath: StringProperty(subtype='FILE_PATH')
+    
     def execute(self, context):
-        if not bpy.data.filepath:
-            self.report({'ERROR'}, "Save your .blend file first")
+        if not self.filepath:
+            self.report({'ERROR'}, "No filepath specified")
             return {'CANCELLED'}
         
-        blend_dir = os.path.dirname(bpy.data.filepath)
-        report_path = os.path.join(blend_dir, "missing_files_report.txt")
-        
         try:
-            with open(report_path, 'w', encoding='utf-8') as f:
+            with open(self.filepath, 'w') as f:
                 f.write("=" * 80 + "\n")
                 f.write("MISSING FILES REPORT\n")
-                f.write(f"Blender File: {bpy.data.filepath}\n")
                 f.write("=" * 80 + "\n\n")
                 
-                for idx, item in enumerate(context.scene.missing_files, 1):
-                    f.write(f"{idx}. MISSING FILE:\n")
-                    f.write(f"   File Name: {item.file_name}\n")
-                    f.write(f"   File Type: {item.file_type}\n")
-                    f.write(f"   Original Path: {item.filepath}\n")
-                    f.write(f"   Used in Materials: {item.material_names}\n")
-                    f.write(f"   Assigned to Objects: {item.object_names}\n")
-                    f.write(f"   Node Names: {item.node_names}\n\n")
+                if bpy.data.filepath:
+                    f.write(f"Blend File: {bpy.data.filepath}\n\n")
                 
-                f.write("=" * 80 + "\n")
-                f.write(f"Total missing files: {len(context.scene.missing_files)}\n")
+                f.write(f"Total Missing Files: {len(context.scene.missing_files)}\n\n")
+                
+                # Group by type
+                files_by_type = {}
+                for item in context.scene.missing_files:
+                    file_type = item.file_type
+                    if file_type not in files_by_type:
+                        files_by_type[file_type] = []
+                    files_by_type[file_type].append(item)
+                
+                # Write each type group
+                for file_type, items in sorted(files_by_type.items()):
+                    f.write("=" * 80 + "\n")
+                    f.write(f"{file_type} FILES ({len(items)})\n")
+                    f.write("=" * 80 + "\n\n")
+                    
+                    for item in items:
+                        f.write(f"File: {item.file_name}\n")
+                        f.write(f"Path: {item.filepath}\n")
+                        f.write(f"Status: {'USED' if item.is_used else 'UNUSED'}\n")
+                        
+                        if item.is_linked:
+                            f.write(f"Linked from: {item.library_path}\n")
+                        
+                        if item.material_names != "(none)":
+                            f.write(f"Materials: {item.material_names}\n")
+                        if item.object_names != "(unused)":
+                            f.write(f"Objects: {item.object_names}\n")
+                        if item.node_names != "(none)":
+                            f.write(f"Nodes: {item.node_names}\n")
+                        
+                        f.write("\n" + "-" * 80 + "\n\n")
+                
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("END OF REPORT\n")
                 f.write("=" * 80 + "\n")
             
-            self.report({'INFO'}, f"Report exported to: {report_path}")
+            self.report({'INFO'}, f"Report exported to: {self.filepath}")
+            return {'FINISHED'}
+        
         except Exception as e:
             self.report({'ERROR'}, f"Failed to export report: {str(e)}")
             return {'CANCELLED'}
+    
+    def invoke(self, context, event):
+        # Set default filename
+        if bpy.data.filepath:
+            blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+            self.filepath = os.path.join(os.path.dirname(bpy.data.filepath), f"{blend_name}_missing_files_report.txt")
+        else:
+            self.filepath = "missing_files_report.txt"
         
-        return {'FINISHED'}
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
 
 
 class FILE_PT_missing_panel_shader(Panel):
-    """Panel for managing missing files in Shader Editor"""
-    bl_label = "BB Missing File Manager"
+    """Panel in Shader Editor for missing file management"""
+    bl_label = "Missing Files"
     bl_idname = "FILE_PT_missing_panel_shader"
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'UI'
-    bl_category = 'BB Missing Files'
+    bl_category = 'Missing Files'
     
     def draw(self, context):
         layout = self.layout
         scene = context.scene
         settings = scene.missing_file_settings
         
-        # Purge All Orphans button (at the very top - clean first!)
+        # Purge button (on top)
         row = layout.row()
-        row.scale_y = 1.3
         row.operator("file.purge_all_orphans", icon='TRASH')
         
-        # Scan button
-        row = layout.row()
+        # Main control buttons
+        row = layout.row(align=True)
         row.scale_y = 1.5
-        row.operator("file.scan_missing", icon='VIEWZOOM')
+        row.operator("file.scan_missing", text="Scan for Missing Files", icon='VIEWZOOM')
         
         # Export button
         row = layout.row()
